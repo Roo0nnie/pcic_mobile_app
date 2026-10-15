@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI-6 / F-26: least privilege, stated rather than inherited.
+#
+# Without a block here the job runs on whatever the repository/organization
+# default grants, which is commonly write-all — the caller's token is the
+# ceiling for the reusable workflow, so an unstated default is the broadest
+# possible grant to external code.
+#
+# This is deliberately not a bare `contents: read`. A called workflow can only
+# restrict the caller's token, never escalate it, and the quality gate posts
+# coverage comments and check results, which need `pull-requests: write` and
+# `checks: write`; a read-only baseline here would break them on every PR.
+# These three are the callee's actual requirements (confirmed in the CI-3
+# review of the pinned SHA below) and nothing more — no `packages`, no
+# `id-token`, no `actions: write`.
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  quality:
+    # Pinned to a full commit SHA, not @main: every deploy gates on this job
+    # (`needs: ci`), so a branch ref lets an external repository change our
+    # quality gate — or replace it — without a single review here.
+    #
+    # Pinned commit: db900a0 "Update timeout settings for jobs in quality gate
+    # workflow" (2026-07-05). Reviewed at this SHA on 2026-08-12 (CI-3 / F-09);
+    # it runs, in order: pnpm typecheck, pnpm lint, pnpm format, and
+    # `pnpm turbo test:cov` for unit tests, plus Playwright e2e when web or its
+    # upstream packages change. A final `quality-gate` job fails the run if
+    # static checks or e2e fail, so the gate is real rather than nominal.
+    #
+    # To move the pin: re-review the workflow at the new SHA, then update both
+    # the ref and this comment together.
+    uses: Quanby-IT-Solutions/.github/.github/workflows/quality-gate.yml@db900a082cd9f7d1315d1192748324cf49647410 # 2026-07-05
+    # `secrets: inherit` handed every repository secret — AWS keys, the auth
+    # signing secret, the database URL — to an external workflow that declares
+    # exactly one optional secret. Only that one is passed now, so a compromise
+    # of the external repo has nothing to exfiltrate.
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

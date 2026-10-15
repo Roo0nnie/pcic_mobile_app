@@ -1,0 +1,199 @@
+# ==========================================================
+# TURBOREPO DEVELOPMENT ENVIRONMENT
+# ==========================================================
+# This Docker Compose configuration sets up the full application stack
+# for local development with both web and backend services.
+#
+# Single entrypoint (default): Nginx reverse proxy on http://localhost
+#   /api/* -> backend (NestJS),  /* -> web (Next.js)
+#
+# SWAPPING THE PROXY
+# ------------------
+# The bundled Nginx is gated behind the "docker-proxy" compose profile,
+# enabled by default via COMPOSE_PROFILES in the root .env. To use your
+# OWN/external Nginx instead, set COMPOSE_PROFILES= (empty) in .env — the
+# nginx container won't start, freeing port 80. web/backend are always
+# published on 127.0.0.1:3001 / :3000, so a host Nginx can reach them.
+#
+# Edit routing live: ./nginx/nginx.conf is volume-mounted; after changes
+#   docker compose restart nginx
+#
+# Usage:
+#   docker-compose up -d --build      # Build + start all services
+#   docker-compose down                # Stop and remove containers
+#   docker-compose logs -f            # Follow logs
+# ==========================================================
+
+services:
+  # ----------------------------------------------------------
+  # Reverse Proxy (Nginx) — single entrypoint, toggleable
+  # ----------------------------------------------------------
+  # Routes /api/* -> backend:3000, everything else -> web:3001.
+  # Access the whole stack at http://localhost
+  #
+  # Gated by the "docker-proxy" profile. ON by default (COMPOSE_PROFILES
+  # in .env). Set COMPOSE_PROFILES= empty to disable and use external Nginx.
+  nginx:
+    image: nginx:alpine
+    container_name: turbo-template-nginx
+    profiles: ["docker-proxy"]
+    ports:
+      - "80:80" # single published port (clean URLs, no :port)
+      - "443:443" # TLS, used by the production config
+    # Upstream hosts, so one config serves both dev topologies. Defaults are the
+    # compose service names; override in the root .env to point at the host when
+    # only Nginx runs in Docker and the apps run under `pnpm dev`:
+    #   WEB_UPSTREAM=host.docker.internal:3001
+    #   BACKEND_UPSTREAM=host.docker.internal:3000
+    environment:
+      - WEB_UPSTREAM=${WEB_UPSTREAM:-web:3001}
+      - BACKEND_UPSTREAM=${BACKEND_UPSTREAM:-backend:3000}
+    # Lets the container reach apps running on the host, which is what the
+    # host.docker.internal upstreams above resolve through.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # ED-2: defaults to the HTTP-only dev config so a fresh clone works with
+      # no certificates. Point NGINX_CONF at ./nginx/nginx.conf for the
+      # TLS-terminating production config, and mount certificates alongside.
+      #
+      # Mounted as a TEMPLATE, not straight into conf.d: the image's entrypoint
+      # runs envsubst over /etc/nginx/templates and writes the result to
+      # conf.d/default.conf. Only names that exist in the environment are
+      # substituted, so Nginx's own $host / $remote_addr survive untouched.
+      - ${NGINX_CONF:-./nginx/nginx.dev.conf}:/etc/nginx/templates/default.conf.template:ro
+      # Certificates and the ACME webroot. Both are optional locally; the dev
+      # config never reads them.
+      - ${NGINX_CERTS_DIR:-./nginx/certs}:/etc/nginx/certs:ro
+      - ${NGINX_ACME_WEBROOT:-./nginx/certbot}:/var/www/certbot
+    networks:
+      - app-network
+    # Only meaningful when the apps run as compose services. With the host
+    # upstreams above there is nothing here to wait for, which is why the
+    # README's `--no-deps` form exists.
+    depends_on:
+      - web
+      - backend
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Web Application (Next.js)
+  # ----------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Build-time arguments for Next.js (inlined during build)
+        - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+        - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}
+        - NEXT_PUBLIC_API_VERSION=${NEXT_PUBLIC_API_VERSION}
+    container_name: turbo-template-web
+    # Bound to loopback so an external/host Nginx can reach it when the
+    # bundled proxy is disabled. Not exposed to the LAN. The Docker Nginx
+    # still reaches it by service name (web:3001) over the internal network.
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      # Server Configuration
+      - NODE_ENV=production
+      # Next.js standalone server defaults to 3000 — pin it to 3001 so it
+      # matches the Nginx upstream and EXPOSE.
+      - PORT=3001
+      - HOSTNAME=0.0.0.0
+
+      # Server-side (SSR) calls stay on the internal Docker network
+      - INTERNAL_API_BASE_URL=http://backend:3000/api
+
+      # Public URLs (Client-side accessible, baked at build time)
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+      - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}
+      - NEXT_PUBLIC_API_VERSION=${NEXT_PUBLIC_API_VERSION}
+    env_file:
+      - apps/web/.env
+    networks:
+      - app-network
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Backend API (NestJS)
+  # ----------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    container_name: turbo-template-backend
+    # Bound to loopback so an external/host Nginx can reach it when the
+    # bundled proxy is disabled. Not exposed to the LAN. The Docker Nginx
+    # still reaches it by service name (backend:3000) over the internal network.
+    ports:
+      - "127.0.0.1:3000:3000"
+    # Lets the container reach a Postgres running on the host via
+    # host.docker.internal (set DATABASE_URL accordingly). Harmless if you
+    # instead run a Postgres service in compose.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Server Configuration
+      - NODE_ENV=production
+      - PORT=3000
+      # AB-2: point the backend at the `redis` service this file already starts.
+      # Without it the stack ran a Redis nothing connected to — the backend fell
+      # back to process-local throttle counters and RBAC cache, so the guarantee
+      # that limits hold cluster-wide and a revoked role dies everywhere at once
+      # silently did not apply here, unlike staging and production which both
+      # set this. The host is the service name, not localhost: inside the
+      # container `localhost` is the backend itself.
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    env_file:
+      - apps/backend/.env
+    # Redis is a plain cache, so this only orders startup — the app degrades
+    # deliberately when the store is unreachable rather than refusing to boot.
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3000/api/v1/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Redis — shared throttle counters + RBAC permission cache (AB-2)
+  # ----------------------------------------------------------
+  # No `ports:` mapping on purpose. Redis is reachable only from the compose
+  # network by service name; publishing it would expose an authenticated but
+  # internet-facing data store for no reason.
+  redis:
+    image: redis:7-alpine
+    container_name: turbo-template-redis
+    # `requirepass` via command so the password comes from the environment
+    # rather than a baked-in config file. REDIS_PASSWORD has no default: an
+    # unauthenticated Redis must not be reachable even inside the network.
+    command:
+      ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD is required}", "--appendonly", "no"]
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge

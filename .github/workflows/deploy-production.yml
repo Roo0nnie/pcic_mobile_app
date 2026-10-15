@@ -1,0 +1,510 @@
+name: Deploy Production (EC2 + ALB + ASG)
+
+on:
+  push:
+    branches:
+      - production
+    paths-ignore:
+      - "**/*.md"
+      - ".vscode/**"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  # Never cancel an in-flight production deploy: interrupting a rolling
+  # instance refresh leaves the ASG split across two image versions.
+  cancel-in-progress: false
+
+# CI-5: least privilege. This workflow reads the repo and talks to AWS with
+# its own credentials; it never needs to write anything back to GitHub.
+permissions:
+  contents: read
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Gate: CI must pass before deploying
+  # ──────────────────────────────────────────────
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  deploy-production:
+    name: Deploy to Production (EC2 + ALB + ASG)
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      # ==========================================================
+      # AWS Configuration
+      # ==========================================================
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+      ECR_REPOSITORY_WEB: ${{ vars.ECR_REPOSITORY_WEB }}
+      ECR_REPOSITORY_BACKEND: ${{ vars.ECR_REPOSITORY_BACKEND }}
+      ASG_NAME: ${{ vars.ASG_NAME }}
+      LAUNCH_TEMPLATE_ID: ${{ vars.LAUNCH_TEMPLATE_ID }}
+
+      # ==========================================================
+      # App Environment Variables
+      # ==========================================================
+      NODE_ENV: "production"
+      NEXT_PUBLIC_APP_URL: ${{ vars.NEXT_PUBLIC_APP_URL }}
+      NEXT_PUBLIC_API_BASE_URL: ${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+      NEXT_PUBLIC_API_VERSION: ${{ vars.NEXT_PUBLIC_API_VERSION }}
+      BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
+      BETTER_AUTH_TRUSTED_ORIGINS: ${{ secrets.BETTER_AUTH_TRUSTED_ORIGINS }}
+      BETTER_AUTH_COOKIE_DOMAIN: ${{ vars.BETTER_AUTH_COOKIE_DOMAIN }}
+      CORS_ORIGINS: ${{ secrets.CORS_ORIGINS }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+
+      # ==========================================================
+      # Sentry (entirely optional)
+      # ==========================================================
+      # Nothing here is validated below: leave every one of them unset and the
+      # deploy behaves exactly as it did before Sentry existed — no upload, no
+      # DSN, crash reporting off in all three runtimes.
+      #
+      # `vars` vs `secrets` follows what the value actually is. Org and project
+      # slugs are identifiers. A DSN is a write-only ingest key that is inlined
+      # into the browser bundle and shipped to every visitor, so masking it in
+      # CI logs would protect nothing. SENTRY_AUTH_TOKEN is the one real
+      # credential — it can write releases and read source for the whole org —
+      # so it is a secret, and it reaches the build as a BuildKit secret mount
+      # rather than a build arg (see apps/web/Dockerfile).
+      SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+      # Browser runtime, plus tracing for every web runtime. These are
+      # build-time values: they are baked into the image at build, so they are
+      # passed as --build-arg and NOT written to SSM.
+      NEXT_PUBLIC_SENTRY_ENABLED: ${{ vars.NEXT_PUBLIC_SENTRY_ENABLED }}
+      NEXT_PUBLIC_SENTRY_DSN: ${{ vars.NEXT_PUBLIC_SENTRY_DSN }}
+      NEXT_PUBLIC_SENTRY_ENVIRONMENT: ${{ vars.NEXT_PUBLIC_SENTRY_ENVIRONMENT }}
+      NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE: ${{ vars.NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE }}
+
+      # Server, edge and backend runtimes — read from the environment at
+      # container start, so these go into the SSM env payload.
+      #
+      # The DSN is split per app: WEB_SENTRY_DSN feeds the web container and
+      # BACKEND_SENTRY_DSN the backend one, each mapped onto the container-local
+      # SENTRY_DSN name the app already reads (see docker-compose.production.yml).
+      # That is what lets the recommended one-project-per-runtime layout work —
+      # a DSN is what selects the Sentry project, so one shared value would merge
+      # web and backend events. Adopters who want a single project just set both
+      # variables to the same DSN.
+      #
+      # The flag and environment stay shared. One SENTRY_ENVIRONMENT covers all
+      # three runtimes: web and backend are the same deployment, and tagging
+      # their events differently would split one incident across two
+      # environments. It is also passed as a build arg to the web image, where
+      # next.config.ts projects it onto the browser's NEXT_PUBLIC_ twin when that
+      # one is not set explicitly.
+      #
+      # Trace sampling is NOT shared. SENTRY_TRACES_SAMPLE_RATE below reaches the
+      # backend container only (docker-compose.production.yml injects it there
+      # and nowhere else). Every web runtime — browser, Node server and edge —
+      # reads the build-time NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE above, so
+      # changing the runtime value re-samples the backend alone; web tracing
+      # only changes on a rebuild.
+      SENTRY_ENABLED: ${{ vars.SENTRY_ENABLED }}
+      WEB_SENTRY_DSN: ${{ vars.WEB_SENTRY_DSN }}
+      BACKEND_SENTRY_DSN: ${{ vars.BACKEND_SENTRY_DSN }}
+      SENTRY_ENVIRONMENT: ${{ vars.SENTRY_ENVIRONMENT }}
+      SENTRY_TRACES_SAMPLE_RATE: ${{ vars.SENTRY_TRACES_SAMPLE_RATE }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # ──────────────────────────────────────────────
+      # Validate required variables
+      # ──────────────────────────────────────────────
+      - name: Validate required deployment variables
+        run: |
+          set -euo pipefail
+
+          require_var() {
+            local name="$1"
+            if [ -z "${!name:-}" ]; then
+              echo "❌ Missing required variable: $name"
+              exit 1
+            fi
+          }
+
+          # AWS
+          require_var AWS_REGION
+          require_var PROJECT_NAME
+          require_var ECR_REPOSITORY_WEB
+          require_var ECR_REPOSITORY_BACKEND
+          require_var ASG_NAME
+          require_var LAUNCH_TEMPLATE_ID
+
+          # App
+          require_var NEXT_PUBLIC_APP_URL
+          require_var NEXT_PUBLIC_API_BASE_URL
+          require_var NEXT_PUBLIC_API_VERSION
+          require_var BETTER_AUTH_COOKIE_DOMAIN
+          require_var DATABASE_URL
+          require_var CORS_ORIGINS
+          require_var BETTER_AUTH_SECRET
+          require_var BETTER_AUTH_TRUSTED_ORIGINS
+
+          echo "✅ Required deployment variables are set"
+
+      # ──────────────────────────────────────────────
+      # Build and push Docker images to ECR
+      # ──────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2
+        with:
+          mask-password: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: /tmp/.buildx-cache
+          # CI-6 / F-27: the key is content-addressed on the Dockerfiles and
+          # the lockfile, and restore-keys is scoped to the same ref. A broad
+          # prefix let a build on any ref restore -- and then extend -- a cache
+          # populated by another ref, which is a path for a poisoned layer from
+          # an untrusted branch to reach a deploy build.
+          key: ${{ runner.os }}-buildx-production-${{ github.ref_name }}-${{ hashFiles('apps/*/Dockerfile', 'pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-production-${{ github.ref_name }}-${{ hashFiles('apps/*/Dockerfile', 'pnpm-lock.yaml') }}-
+            ${{ runner.os }}-buildx-production-${{ github.ref_name }}-
+
+      - name: Build and push Web image to ECR
+        id: build-web
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "=========================================="
+          echo "Building Web Docker Image (production)"
+          echo "=========================================="
+
+          # The auth token is the one value passed as --secret, not --build-arg:
+          # a build arg is baked into the image's history, a secret mount is not.
+          # Everything else here is a public identifier or a NEXT_PUBLIC_* value
+          # that has to be inlined into the client bundle at build time anyway.
+          #
+          # Every Sentry build arg below is passed unconditionally, so an unset
+          # repository variable reaches the build as an empty string rather than
+          # as an absent one. That is deliberate and safe: apps/web/env.ts treats
+          # an empty flag as unset, so a deploy with no Sentry configuration
+          # builds and ships exactly as it did before Sentry existed.
+          docker buildx build \
+            --file apps/web/Dockerfile \
+            --secret id=sentry_auth_token,env=SENTRY_AUTH_TOKEN \
+            --build-arg NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL \
+            --build-arg NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL \
+            --build-arg NEXT_PUBLIC_API_VERSION=$NEXT_PUBLIC_API_VERSION \
+            --build-arg SENTRY_ORG=$SENTRY_ORG \
+            --build-arg SENTRY_PROJECT=$SENTRY_PROJECT \
+            --build-arg NEXT_PUBLIC_SENTRY_ENABLED=$NEXT_PUBLIC_SENTRY_ENABLED \
+            --build-arg NEXT_PUBLIC_SENTRY_DSN=$NEXT_PUBLIC_SENTRY_DSN \
+            --build-arg NEXT_PUBLIC_SENTRY_ENVIRONMENT=$NEXT_PUBLIC_SENTRY_ENVIRONMENT \
+            --build-arg SENTRY_ENVIRONMENT=$SENTRY_ENVIRONMENT \
+            --build-arg NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE=$NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --push \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY_WEB:$IMAGE_TAG \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY_WEB:production-latest \
+            .
+
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+          echo "✓ Web image pushed"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY_WEB:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build and push Backend image to ECR
+        id: build-backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "=========================================="
+          echo "Building Backend Docker Image (production)"
+          echo "=========================================="
+
+          docker buildx build \
+            --file apps/backend/Dockerfile \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --push \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:$IMAGE_TAG \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:production-latest \
+            .
+
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+          echo "✓ Backend image pushed"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ──────────────────────────────────────────────
+      # Update SSM parameters
+      # ──────────────────────────────────────────────
+      - name: Update SSM parameters
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          # CI-5 / RF4: refuse to continue past an error, so a partial run
+          # cannot proceed to publish a half-built parameter.
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "Updating SSM parameters"
+          echo "=========================================="
+
+          # Store docker-compose.production.yml in SSM (base64)
+          COMPOSE_B64=$(base64 -w0 docker-compose.production.yml)
+          aws ssm put-parameter \
+            --name "/${PROJECT_NAME}/production/docker-compose" \
+            --type String \
+            --value "$COMPOSE_B64" \
+            --overwrite
+
+          # CI-5 / F-25: the env file is PIPED, never written to disk.
+          #
+          # It used to be `cat > /tmp/deploy.env`, holding every production
+          # secret in plaintext on the runner. The `rm -f` that followed was
+          # not guaranteed to run: any failure between the write and the delete
+          # left the file behind for the rest of the job, and for anything else
+          # sharing that runner.
+          #
+          # Building the value in a pipeline keeps it in memory only, so there
+          # is no file to leak and no cleanup step to depend on. The value is
+          # fed to the AWS CLI on stdin rather than as an argument, so it never
+          # appears in the process list where `ps` would expose it.
+          ENV_B64=$(
+            {
+              printf 'ECR_REGISTRY=%s\n' "$ECR_REGISTRY"
+              printf 'ECR_REPOSITORY_WEB=%s\n' "$ECR_REPOSITORY_WEB"
+              printf 'ECR_REPOSITORY_BACKEND=%s\n' "$ECR_REPOSITORY_BACKEND"
+              printf 'IMAGE_TAG=%s\n' "$IMAGE_TAG"
+              printf 'NEXT_PUBLIC_APP_URL=%s\n' "$NEXT_PUBLIC_APP_URL"
+              printf 'NEXT_PUBLIC_API_BASE_URL=%s\n' "$NEXT_PUBLIC_API_BASE_URL"
+              printf 'NEXT_PUBLIC_API_VERSION=%s\n' "$NEXT_PUBLIC_API_VERSION"
+              printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+              printf 'CORS_ORIGINS=%s\n' "$CORS_ORIGINS"
+              printf 'BETTER_AUTH_SECRET=%s\n' "$BETTER_AUTH_SECRET"
+              printf 'BETTER_AUTH_TRUSTED_ORIGINS=%s\n' "$BETTER_AUTH_TRUSTED_ORIGINS"
+              printf 'BETTER_AUTH_COOKIE_DOMAIN=%s\n' "$BETTER_AUTH_COOKIE_DOMAIN"
+              printf 'GOOGLE_CLIENT_ID=%s\n' "$GOOGLE_CLIENT_ID"
+              printf 'GOOGLE_CLIENT_SECRET=%s\n' "$GOOGLE_CLIENT_SECRET"
+              # Sentry runtime config for the web (server + edge) and backend
+              # containers. Empty when unconfigured, which both runtimes read as
+              # "off". No release variable is needed: IMAGE_TAG above is the
+              # commit SHA and instrument.ts already reports it as the release.
+              #
+              # The two DSNs are per app; compose maps each onto the SENTRY_DSN
+              # name its container reads. Set both to the same value to collapse
+              # web and backend into one Sentry project.
+              #
+              # SENTRY_TRACES_SAMPLE_RATE is consumed by the backend container
+              # only. Web tracing (browser, server and edge) comes from the
+              # NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE build arg instead.
+              printf 'SENTRY_ENABLED=%s\n' "$SENTRY_ENABLED"
+              printf 'WEB_SENTRY_DSN=%s\n' "$WEB_SENTRY_DSN"
+              printf 'BACKEND_SENTRY_DSN=%s\n' "$BACKEND_SENTRY_DSN"
+              printf 'SENTRY_ENVIRONMENT=%s\n' "$SENTRY_ENVIRONMENT"
+              printf 'SENTRY_TRACES_SAMPLE_RATE=%s\n' "$SENTRY_TRACES_SAMPLE_RATE"
+            } | base64 -w0
+          )
+
+          printf '%s' "$ENV_B64" | aws ssm put-parameter \
+            --name "/${PROJECT_NAME}/production/env" \
+            --type SecureString \
+            --value file:///dev/stdin \
+            --overwrite
+
+          # Drop the value from the shell's memory as soon as it is published.
+          unset ENV_B64
+          echo "✓ SSM parameters updated"
+
+      # ──────────────────────────────────────────────
+      # Rolling deployment via ASG instance refresh
+      # ──────────────────────────────────────────────
+      - name: Create new launch template version
+        id: launch-template
+        run: |
+          echo "=========================================="
+          echo "Creating new launch template version"
+          echo "=========================================="
+
+          # Create a new version with updated description (triggers instance refresh)
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+            --source-version '$Latest' \
+            --version-description "deploy-$IMAGE_TAG" \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "✓ Launch template version $NEW_VERSION created"
+
+          # Set it as the default
+          aws ec2 modify-launch-template \
+            --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+            --default-version "$NEW_VERSION"
+
+          echo "✓ Default version set to $NEW_VERSION"
+
+      - name: Start ASG instance refresh
+        id: instance-refresh
+        run: |
+          echo "=========================================="
+          echo "Starting ASG instance refresh"
+          echo "=========================================="
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{
+              "MinHealthyPercentage": 100,
+              "MaxHealthyPercentage": 200,
+              "InstanceWarmup": 300,
+              "SkipMatching": false
+            }' \
+            --query 'InstanceRefreshId' \
+            --output text)
+
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+          echo "✓ Instance refresh started: $REFRESH_ID"
+
+      - name: Wait for instance refresh to complete
+        run: |
+          echo "=========================================="
+          echo "Waiting for instance refresh"
+          echo "=========================================="
+
+          REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
+          MAX_WAIT=40  # 40 * 30s = 20 minutes
+          POLL_INTERVAL=30
+
+          for i in $(seq 1 $MAX_WAIT); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+
+            PERCENTAGE=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query 'InstanceRefreshes[0].PercentageComplete' \
+              --output text 2>/dev/null || echo "0")
+
+            echo "[$i/$MAX_WAIT] Status: $STATUS | Progress: ${PERCENTAGE}%"
+
+            case "$STATUS" in
+              Successful)
+                echo "✓ Instance refresh completed successfully"
+                break
+                ;;
+              Failed|Cancelled|RollbackSuccessful|RollbackFailed)
+                echo "❌ Instance refresh $STATUS"
+
+                STATUS_REASON=$(aws autoscaling describe-instance-refreshes \
+                  --auto-scaling-group-name "$ASG_NAME" \
+                  --instance-refresh-ids "$REFRESH_ID" \
+                  --query 'InstanceRefreshes[0].StatusReason' \
+                  --output text 2>/dev/null || echo "Unknown")
+
+                echo "Reason: $STATUS_REASON"
+                exit 1
+                ;;
+              *)
+                sleep $POLL_INTERVAL
+                ;;
+            esac
+          done
+
+          # Final check if we timed out
+          if [ "$STATUS" != "Successful" ]; then
+            echo "❌ Timed out waiting for instance refresh (status: $STATUS)"
+            exit 1
+          fi
+
+      # ──────────────────────────────────────────────
+      # Verify ALB health
+      # ──────────────────────────────────────────────
+      - name: Verify ALB target health
+        run: |
+          echo "=========================================="
+          echo "Verifying ALB target health"
+          echo "=========================================="
+
+          sleep 30
+
+          ALL_HEALTHY=true
+          for TG_NAME in "${PROJECT_NAME}-web-tg-production" "${PROJECT_NAME}-backend-tg-production"; do
+            TG_ARN=$(aws elbv2 describe-target-groups \
+              --names "$TG_NAME" \
+              --query 'TargetGroups[0].TargetGroupArn' \
+              --output text 2>/dev/null || echo "NOT_FOUND")
+
+            if [ "$TG_ARN" = "NOT_FOUND" ]; then
+              echo "⚠️  Target group $TG_NAME not found (may have different naming)"
+              continue
+            fi
+
+            HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TG_ARN" \
+              --query 'TargetHealthDescriptions[*].TargetHealth.State' \
+              --output text)
+
+            echo "Target group: $TG_NAME"
+            echo "Health states: $HEALTH"
+
+            if echo "$HEALTH" | grep -q "healthy"; then
+              echo "✓ $TG_NAME has healthy targets"
+            else
+              echo "❌ $TG_NAME has no healthy targets"
+              ALL_HEALTHY=false
+            fi
+          done
+
+          if [ "$ALL_HEALTHY" = "false" ]; then
+            echo "⚠️  Some targets are unhealthy — check AWS Console"
+            exit 1
+          fi
+
+      # ──────────────────────────────────────────────
+      # Summary
+      # ──────────────────────────────────────────────
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "Production Deployment Complete!"
+          echo "=========================================="
+          echo "Strategy:     EC2 + ALB + ASG (rolling instance refresh)"
+          echo "ASG:          ${{ vars.ASG_NAME }}"
+          echo "Region:       ${{ env.AWS_REGION }}"
+          echo "Branch:       production"
+          echo "Commit SHA:   ${{ github.sha }}"
+          echo ""
+          echo "Web Image:    ${{ steps.build-web.outputs.image }}"
+          echo "Backend Image: ${{ steps.build-backend.outputs.image }}"
+          echo "LT Version:  ${{ steps.launch-template.outputs.version }}"
+          echo "Refresh ID:  ${{ steps.instance-refresh.outputs.refresh_id }}"
+          echo "=========================================="
